@@ -1,6 +1,8 @@
 --[[=========================================================================
-    Magic Loot  -  Fluent Hub v3
-    UI: Fluent (dawid-scripts).  Every tunable is a free-text number box.
+    Magic Loot  -  Fluent Hub v4
+    UI: Fluent (dawid-scripts).  Toggles only - every rate and threshold is a
+    constant below, set to the value that measured best over ~20 farm runs.
+    One switch (OneClick) runs the whole economy loop.
 
     Verified against the decompiled client:
       enemies      CollectionService:GetTagged("Enemy") -> HumanoidRootPart;
@@ -25,11 +27,13 @@
     What cannot be multiplied from the client (measured, not assumed):
     damage per hit and gain per training tap are computed server-side.  42
     presses/second produced the same stage clear time as 1 press/second, so the
-    number boxes buy request *rate* - never a damage or gain multiplier.  The
-    real throughput lever for farming is stage rotation speed.
+    old number boxes bought request *rate* - never a damage or gain multiplier.
+    The real throughput lever for farming is stage rotation speed, so the rates
+    below are pinned at the point where nothing waits and nothing is dropped.
 
     Pacing: ToolSystem.RequestRateLimit allows 20 requests/second per message
-    name.  The gate below defaults to 18 and is itself a number box.
+    name.  The gate below is fixed at 18, which leaves the game's own traffic
+    room; raising it only gets requests thrown away.
 =========================================================================]]
 
 if _G.__MagicLootHub then
@@ -48,6 +52,7 @@ local function CreateMagicLootHub()
     local ReplicatedFirst   = game:GetService("ReplicatedFirst")
     local Lighting          = game:GetService("Lighting")
     local RunService        = game:GetService("RunService")
+    local HttpService       = game:GetService("HttpService")
     local LP                = Players.LocalPlayer
 
     -- Chinese instance names, byte-escaped so this file stays ASCII-clean.
@@ -97,13 +102,18 @@ local function CreateMagicLootHub()
     -- the game's NetWork inside such a callback permanently strips the
     -- thread's capabilities and every later CoreGui write fails with
     -- "lacking capability Plugin".  So: callbacks mutate S, workers act.
+    --
+    -- The numbers here used to be number boxes.  They are constants now: the
+    -- values are the ones that measured best (+22.1M gold / 200s on the run
+    -- that set them), and every one of them is a rate or a safety margin that
+    -- has a right answer rather than a preference.
     local S = {
         running = true,
 
         -- combat
         killAura      = false,
         auraSlots     = { [SLOT_NORMAL] = true, [1] = true, [2] = true, [3] = true },
-        attacksPerSec = 12,      -- number box, unbounded
+        attacksPerSec = 14,      -- presses/s; the wand's own rhythm gates the rest
         auraRange     = 400,     -- studs; the game's own target gate is 60
         snapToTarget  = true,
         snapDistance  = 12,
@@ -116,10 +126,10 @@ local function CreateMagicLootHub()
         autoFarm      = false,
         stageStart    = 1,
         stageEnd      = 0,       -- 0 = CareerMaxStage + 1
-        stageSeconds  = 70,      -- hard timeout before advancing
-        spawnWait     = 36,      -- a wave lands every ~32s, so wait one out
+        stageSeconds  = 120,     -- safety wall-clock only; the ETA rule decides
+        spawnWait     = 40,      -- a wave lands every ~32s, so wait one out
         clearsPerStage = 1,      -- advance after this many cleared waves
-        maxClearSecs  = 60,      -- give up on a wave that would take longer
+        etaLimit      = 35,      -- health / dps over this many seconds = walk away
         dps           = 0,       -- measured damage per second, for that estimate
         retreatHP     = 45,      -- percent
         returnHP      = 95,      -- percent
@@ -131,7 +141,7 @@ local function CreateMagicLootHub()
 
         -- drops
         autoPickup    = false,
-        pickupPerSec  = 4,       -- scan passes per second
+        pickupPerSec  = 5,       -- scan passes per second
         needFlush     = false,   -- set when the temp bag fills up
 
         -- selling
@@ -144,7 +154,7 @@ local function CreateMagicLootHub()
 
         -- training
         autoTrain     = false,
-        tapsPerSec    = 10,
+        tapsPerSec    = 14,
         trainInFlight = 0,
         trainGain     = 0,
 
@@ -156,6 +166,25 @@ local function CreateMagicLootHub()
 
         -- rebirth
         autoRebirth   = false,
+
+        -- one click
+        oneClick      = false,
+        ocFarm        = true,
+        ocCollect     = true,
+        ocSell        = true,
+        ocTrain       = true,
+        ocWand        = true,
+        ocRebirth     = true,
+
+        -- webhook
+        hookUrl       = "",
+        hookRarity    = 6,       -- notify on drops at this xyd rarity or above
+        hookItems     = true,
+        hookRebirth   = true,
+        hookSales     = true,
+        hookTest      = false,
+        hookSent      = 0,
+        hookFail      = "",
 
         -- performance
         perfWanted    = false,
@@ -247,6 +276,68 @@ local function CreateMagicLootHub()
             if n >= u[1] then return ("%.2f%s"):format(n / u[1], u[2]) end
         end
         return comma(n)
+    end
+
+    ------------------------------------------------------------------
+    -- 5a. Webhook  (the user's own URL - nothing is hard-coded)
+    ------------------------------------------------------------------
+    -- One HTTP POST per event would rate-limit a Discord webhook inside a
+    -- second (a single wave drops 11 items), so events are queued as lines and
+    -- a worker posts one batched message every few seconds.  Everything here is
+    -- pcall'd and off the farm's thread: a dead URL must never stall a run.
+    local RARITY = {
+        "Common", "Uncommon", "Fine", "Rare", "Epic", "Legendary",
+        "Mythic", "Ancient", "Divine", "Celestial", "Transcendent",
+    }
+    local function rarityName(x)
+        x = math.floor(num(x, 0))
+        return RARITY[x] or ("Rarity " .. x)
+    end
+
+    local hookQueue, hookLast = {}, 0
+
+    local function httpPost(url, payload)
+        local rq = rawget(_G, "request") or rawget(_G, "http_request")
+            or (type(syn) == "table" and syn.request)
+            or (type(http) == "table" and http.request)
+        if type(rq) ~= "function" then return false, "executor has no request()" end
+        local ok, res = pcall(rq, {
+            Url     = url,
+            Method  = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body    = HttpService:JSONEncode(payload),
+        })
+        if not ok then return false, tostring(res) end
+        local code = tonumber(type(res) == "table" and res.StatusCode) or 0
+        if code >= 200 and code < 300 then return true, "ok" end
+        return false, ("HTTP %d"):format(code)
+    end
+
+    local function hookPush(line)
+        if S.hookUrl == "" or not line then return end
+        if #hookQueue >= 60 then return end          -- never grow without bound
+        hookQueue[#hookQueue + 1] = tostring(line)
+    end
+
+    local function hookFlush()
+        if S.hookUrl == "" or #hookQueue == 0 then return end
+        if os.clock() - hookLast < 3 then return end -- Discord allows ~30/min
+        hookLast = os.clock()
+        local lines = {}
+        while #hookQueue > 0 and #lines < 14 do
+            lines[#lines + 1] = table.remove(hookQueue, 1)
+        end
+        local body = table.concat(lines, "\n"):sub(1, 1900)
+        local ok, why = httpPost(S.hookUrl, {
+            username = "Magic Loot Hub",
+            content  = body,
+        })
+        if ok then
+            S.hookSent += #lines
+            S.hookFail = ""
+        else
+            S.hookFail = why
+        end
     end
 
     local function charOf()   return LP.Character end
@@ -599,15 +690,19 @@ local function CreateMagicLootHub()
         return (barren[n] or 0) < 3
     end
 
-    -- The run has to be walked from stage 1 anyway, and the server only lets it
-    -- reach CareerMaxStage + 1, so the ceiling comes from career progression -
-    -- not from what the streamer happens to have loaded (that ran away to 21).
+    -- The run has to be walked from stage 1 anyway, and the ceiling is the career
+    -- gate itself - CareerMaxStage.  It used to aim one room higher on the theory
+    -- that the server lets you knock on the next door; measured, it does not: with
+    -- CareerMaxStage 11 the door to 12 refused every attempt, and each lap spent
+    -- 40-80s on it (including clearing stage 11's 425B wave for nothing) and then
+    -- churned the corridor instead of farming.  A whole 300s window earned zero
+    -- gold that way.  When the career gate moves, this follows it on its own.
     local function stageCeiling()
         if num(S.stageEnd, 0) > 0 then
             return math.clamp(math.floor(S.stageEnd), 1, MAX_STAGE)
         end
         local cm = LP:FindFirstChild("CareerMaxStage")
-        local career = cm and math.floor(tonumber(cm.Value) or 1) + 1 or 1
+        local career = cm and math.floor(tonumber(cm.Value) or 1) or 1
         return math.clamp(math.max(career, frontier), 1, MAX_STAGE)
     end
 
@@ -772,11 +867,52 @@ local function CreateMagicLootHub()
         return v and math.floor(tonumber(v.Value) or 0) or 0
     end
 
-    -- Temp-bag capacity is Bag.5 ("+1 Slot Space"); it reads 5 on this account.
+    -- Temp-bag capacity is not knowable from the client.  Nothing in
+    -- AllSideCode mentions LimitBagUsed, SystemDrop-Type and SystemBag-Type
+    -- carry no bag/limit strings, and Bag.5 ("+1 Slot Space") is only a mirror
+    -- that grows as upgrades drop - it has read 4, 5, 6, 7 and 8 on this
+    -- account inside one session.  Selling on a stale number is the bug: at a
+    -- remembered cap of 4 we banked (and ended the run) with half a bag, and at
+    -- a cap of 8 that the server did not honour we stood next to loot we would
+    -- not pick up.  So the cap is learned from what the server actually allows:
+    --   * every count we successfully reach raises it;
+    --   * three refusals in a row while standing on a landed drop pins it;
+    --   * a later success, or a higher Bag.5, forgets the pin again.
+    local capKnown, capFull, capFullAt = 0, 0, 0
+    local capMiss = {}
+
+    local function tempHint()
+        local bagF = LP:FindFirstChild("Bag")
+        local v = bagF and bagF:FindFirstChild("5")
+        return math.max(1, math.floor(tonumber(v and v.Value) or 4))
+    end
+
     local function tempCap()
-        local bag = LP:FindFirstChild("Bag")
-        local v = bag and bag:FindFirstChild("5")
-        return v and math.max(1, math.floor(tonumber(v.Value) or 4)) or 4
+        if capFull > 0 and tempHint() <= capFullAt then return capFull end
+        return math.max(1, tempHint(), capKnown)
+    end
+
+    -- The only question the rest of the hub asks: may we still carry anything?
+    local function bagFull()
+        local used = limitBagUsed()
+        return used > 0 and used >= tempCap()
+    end
+
+    -- Called after every DROP_PICKUP whose radius condition we know we met.
+    local function notePickup(before, after)
+        if after > before then
+            capKnown = math.max(capKnown, after)
+            capMiss  = {}
+            if capFull > 0 and after >= capFull then capFull = 0 end
+            return true
+        end
+        -- A refusal at count 0 is a range or replication miss, never a full bag.
+        if before <= 0 then return false end
+        capMiss[before] = (capMiss[before] or 0) + 1
+        if capMiss[before] >= 3 then
+            capFull, capFullAt = before, tempHint()
+        end
+        return false
     end
 
     local lastTry = {}
@@ -794,7 +930,21 @@ local function CreateMagicLootHub()
                     and math.floor(tonumber(d:GetAttribute("Stage")) or 0) == stage then
                     local part = d.PrimaryPart or d:FindFirstChildWhichIsA("BasePart")
                     if part then
-                        out[#out + 1] = { id = d.Name, pos = part.Position }
+                        -- Every drop carries its own price tag: GoldValue, ItemId
+                        -- and Xyd (rarity, also the bucket's name).  That is what
+                        -- makes "grab the expensive one first" possible without a
+                        -- config join - and it matters, because one bag holds 5-8
+                        -- items while a wave drops 11, so whatever we skip is lost.
+                        local id = tonumber(d:GetAttribute("ItemId"))
+                        out[#out + 1] = {
+                            id     = d.Name,
+                            pos    = part.Position,
+                            gold   = tonumber(d:GetAttribute("GoldValue")) or 0,
+                            rarity = math.floor(tonumber(d:GetAttribute("Xyd")) or 0),
+                            item   = id,
+                            name   = id and label("materialConf", id, "Item " .. id)
+                                     or ("Drop " .. d.Name),
+                        }
                     end
                 end
             end
@@ -812,10 +962,9 @@ local function CreateMagicLootHub()
         -- character in different directions; the walk wins by standing down the
         -- pickup for the couple of seconds it takes.
         if S.farmWalking then return 0 end
-        local free = tempCap() - limitBagUsed()
-        if free <= 0 then
+        if bagFull() then
             S.needFlush = true
-            S.note = "pickup: temp bag full, selling"
+            S.note = ("pickup: temp bag full at %d, selling"):format(limitBagUsed())
             return 0
         end
 
@@ -824,9 +973,14 @@ local function CreateMagicLootHub()
         local hrp = root()
         if not hrp then return 0 end
 
-        -- nearest first: fewer teleports, less replication lag to wait out
+        -- Highest value first.  Nearest-first was the wrong sort: a stage-10 wave
+        -- mixes 5.5K commons with 250K+ rarities, the bag holds a fraction of the
+        -- wave, and the flush that empties it ends the run - so whatever is left
+        -- behind is left behind for good.  Distance only breaks ties (the walk
+        -- costs a fraction of a second either way).
         local here = hrp.Position
         table.sort(drops, function(a, b)
+            if a.gold ~= b.gold then return a.gold > b.gold end
             return (a.pos - here).Magnitude < (b.pos - here).Magnitude
         end)
 
@@ -837,10 +991,7 @@ local function CreateMagicLootHub()
         local resumeHover = hoverAt
         hoverAt = nil
         for _, d in ipairs(drops) do
-            -- Bag.5 has been observed climbing (4 -> 5 -> 6) as bag upgrades drop,
-            -- so treat it as a hint and let the server be the real authority: a
-            -- request that does not move LimitBagUsed was refused.
-            if limitBagUsed() >= tempCap() then S.needFlush = true break end
+            if bagFull() then S.needFlush = true break end
             if not S.autoPickup or not S.running then break end
             if not allow(NetMsg.DROP_PICKUP) then break end
             local last = lastTry[d.id]
@@ -851,6 +1002,8 @@ local function CreateMagicLootHub()
                     teleport(d.pos + Vector3.new(0, 3, 0))
                     task.wait(0.25)
                 end
+                hrp = root() or hrp
+                local inRange = (d.pos - hrp.Position).Magnitude <= DROP_REACH
                 local before = limitBagUsed()
                 if pcall(NetWork.FireServer, NetMsg.DROP_PICKUP, d.id) then
                     local landed = false
@@ -858,9 +1011,16 @@ local function CreateMagicLootHub()
                         task.wait(0.05)
                         if limitBagUsed() > before then landed = true break end
                     end
+                    -- Only a refusal we know was in range teaches us the cap.
+                    if inRange then notePickup(before, limitBagUsed()) end
                     if landed then
                         got += 1
                         S.picked += 1
+                        if S.hookItems and d.rarity >= math.floor(num(S.hookRarity, 6)) then
+                            hookPush(("**%s** [%s] - %s gold (stage %d)")
+                                :format(d.name, rarityName(d.rarity), comma(d.gold),
+                                        flag("DungeonAggroStage")))
+                        end
                     else
                         -- let it come round again shortly instead of after 3s
                         lastTry[d.id] = os.clock() - 2
@@ -876,8 +1036,8 @@ local function CreateMagicLootHub()
         if resumeHover and S.hover then hoverHold(resumeHover) end
 
         if got > 0 then
-            S.note = ("pickup: %d drop(s) in, %d temp slot(s) left")
-                :format(got, math.max(0, tempCap() - limitBagUsed()))
+            S.note = ("pickup: %d drop(s) in, %d/%d temp slot(s) used")
+                :format(got, limitBagUsed(), tempCap())
         end
         return got
     end
@@ -899,6 +1059,40 @@ local function CreateMagicLootHub()
     -- stage afterwards.  InitTop debounces the flush by 1.5s, so do we.
     local lastFlush = 0
 
+    -- DUNGEON_RETURN_TOWN clears InDungeonChallenge first and *then* teleports
+    -- you to the lobby spawn: measured, the flag was already 0 when the message
+    -- returned after 0.10s, and the server's move landed 0.62s later, dropping
+    -- the character at (-451.3, 10.1, 38.1) which then slid to (-448.1, 7.8,
+    -- 35.1).  That late pull is the stage-1 reloop bug - the farm read run=0,
+    -- started tweening onto stage 1's front door, and got yanked back to the
+    -- spawn mid-tween, so the door region test never saw us and the run sat at 0
+    -- for 35s.  Waiting the pull out first made door 1 open in 0.27s.
+    --
+    -- There is no event for it, so this watches the position instead and returns
+    -- once it has stopped moving on its own.
+    local function settleAfterTown(maxSecs)
+        cancelMove()
+        hoverStop()
+        local hrp = root()
+        if not hrp then task.wait(0.6) return end
+        local t0, last, still = os.clock(), hrp.Position, 0
+        while os.clock() - t0 < (maxSecs or 2.5) do
+            task.wait(0.12)
+            hrp = root() or hrp
+            local p = hrp.Position
+            local moved = (p - last).Magnitude
+            last = p
+            if moved < 1.2 then
+                still += 0.12
+                -- The pull arrives ~0.6s in, so "already still" is not enough
+                -- on its own; give it long enough to have happened.
+                if still >= 0.36 and os.clock() - t0 > 0.75 then return end
+            else
+                still = 0
+            end
+        end
+    end
+
     local function flushTempBag()
         if limitBagUsed() <= 0 then return false, "nothing pending" end
         if os.clock() - lastFlush < 1.6 then return false, "debounced" end
@@ -910,6 +1104,7 @@ local function CreateMagicLootHub()
         -- wait for the server to actually credit it
         local t0 = os.clock()
         while limitBagUsed() > 0 and os.clock() - t0 < 3 do task.wait(0.1) end
+        settleAfterTown(2.5)
         S.note = "sell: temp bag flushed"
         return true, "ok"
     end
@@ -986,6 +1181,10 @@ local function CreateMagicLootHub()
             S.sold += done
             S.goldFromSales += worth
             S.note = ("sell: %d item(s), ~%s gold"):format(done, short(worth))
+            if S.hookSales then
+                hookPush((":coin: Sold %d item(s) for ~%s gold  (total this session %s)")
+                    :format(done, comma(worth), short(S.goldFromSales)))
+            end
         else
             S.note = ("sell: server rejected %d item(s)"):format(#rows)
         end
@@ -1087,7 +1286,64 @@ local function CreateMagicLootHub()
         S.flushes += 1
         local t0 = os.clock()
         while runStage() > 0 and os.clock() - t0 < 3 do task.wait(0.1) end
+        -- The flag clears ~0.6s before the town teleport actually lands, so
+        -- returning here as soon as it flips hands the caller a character that
+        -- is about to be moved out from under it.  See settleAfterTown.
+        settleAfterTown(2.5)
         return runStage() <= 0
+    end
+
+    -- Confirmed live, and it is the rule the whole corridor turns on: the run
+    -- advances one door at a time, and the server only lets it advance when the
+    -- room the run is *currently* sitting in has no live monsters left.  Probe:
+    -- standing on door 3 with two of stage 2's wave still up, the door refused for
+    -- the full 12s; the same door opened in 0.9s the moment the room behind was
+    -- clear.  A room spawns its wave ~1-2s after it opens, so a brisk climb
+    -- usually beats the spawn and every door looks free - which is exactly why the
+    -- stalls looked random.  When the climb loses that race the answer is to go
+    -- back one room and kill, not to write the stage above off as a career gate.
+    --
+    -- Standing on door k puts us inside stage k's own volume, so the aura - which
+    -- deliberately locks onto our own room - cannot see the wave behind us.
+    -- Dropping into stage k-1's combat volume is what makes it a target.
+    local function clearFrontier(secs)
+        local st = runStage()
+        if st <= 0 then return true end
+        if #enemyList(st) == 0 then return true end
+        hoverStop()
+        teleport(combatStand(st))
+        local t0 = os.clock()
+        while os.clock() - t0 < (secs or 12) do
+            local up = #enemyList(st)
+            if up == 0 then return true end
+            S.farmPhase = ("clearing stage %d to open the next door (%d up)")
+                :format(st, up)
+            auraTick()
+            task.wait(0.2)
+            if not S.running then return false end
+        end
+        return #enemyList(st) == 0
+    end
+
+    -- The run only ever starts from town, and "in town" is the server's opinion,
+    -- not ours.  Measured after a flush taken at stage 10: the character was
+    -- standing on door 1 with DungeonAggroStage still reading 1, then 8, then 9 -
+    -- the server had not let go of the room we came from - and every door touch
+    -- was ignored for 60s.  The tick the aggro flag finally read 0, the door
+    -- opened immediately.  So wait for that flag rather than for the character to
+    -- merely stop moving.
+    local function returnToLobby(secs)
+        settleAfterTown(2.0)
+        local home = lobbyStand() or Vector3.new(-451.29, 10.09, 38.10)
+        local t0 = os.clock()
+        repeat
+            teleport(home)
+            if flag("DungeonAggroStage") <= 0 then return true end
+            S.farmPhase = ("in town, waiting for stage %d to let go")
+                :format(flag("DungeonAggroStage"))
+            task.wait(0.3)
+        until os.clock() - t0 > (secs or 5) or not S.running
+        return flag("DungeonAggroStage") <= 0
     end
 
     -- Push the run forward to stage n, one front door at a time.  Stages the
@@ -1096,25 +1352,81 @@ local function CreateMagicLootHub()
         hoverStop()          -- the door region checks are on the floor
         S.farmWalking = true
         if runStage() <= 0 then
-            teleport(lobbyStand() or Vector3.new(-451.29, 10.09, 38.10))
-            task.wait(0.35)
+            -- Belt and braces with settleAfterTown: this is also reached when the
+            -- run was never open (a fresh start, a death, a manual flush from the
+            -- Bag tab), and in every one of those cases something else may still
+            -- be moving the character.  Walking to a door while the server is
+            -- teleporting us is the whole stage-1 stall.
+            S.farmPhase = "waiting for the town teleport to land"
+            returnToLobby(5)
+            task.wait(0.2)
         end
         for k = math.max(1, runStage() + 1), n do
-            if not S.running then return false end
+            if not S.running then
+                S.farmWalking = false
+                return false
+            end
+            -- The run can lose ground under us: standing in a room it has not
+            -- opened - which is what streaming a far stage used to do - makes the
+            -- server rewind the challenge and pull us to town.  Pushing door k
+            -- when the run is two or more rooms behind can never work, so hand
+            -- back and let the rotation restart the walk from where it really is.
+            if runStage() < k - 1 then
+                S.note = ("farm: the run fell back to %d during the walk to %d")
+                    :format(runStage(), n)
+                S.farmWalking = false
+                return false
+            end
             streamAround(doorStand(k))
-            S.farmPhase = ("opening the run: stage %d"):format(k)
-            local t0 = os.clock()
-            repeat
-                -- Re-assert the position every quarter second.  Arriving once and
-                -- then only watching the flag looked cheaper and was much worse:
-                -- doors that used to open in ~3.5s started timing out at 7s, and
-                -- the run sat at 0 for 35s.  The server's region test wants the
-                -- position replicated repeatedly, and the character drifts.
-                teleport(doorStand(k))
-                task.wait(0.25)
-            until runStage() >= k or os.clock() - t0 > 7
-            if runStage() < k then
-                S.note = ("farm: the run stalled at stage %d"):format(runStage())
+            local opened = false
+            for attempt = 1, 3 do
+                S.farmPhase = (attempt == 1)
+                    and ("opening the run: stage %d"):format(k)
+                    or  ("opening the run: stage %d (try %d)"):format(k, attempt)
+                local t0 = os.clock()
+                repeat
+                    -- Re-assert the position every quarter second.  Arriving once
+                    -- and then only watching the flag looked cheaper and was much
+                    -- worse: doors that used to open in ~3.5s started timing out
+                    -- at 7s, and the run sat at 0 for 35s.  The server's region
+                    -- test wants the position replicated repeatedly, and the
+                    -- character drifts.
+                    teleport(doorStand(k))
+                    task.wait(0.25)
+                until runStage() >= k or os.clock() - t0 > 5 or not S.running
+                if runStage() >= k then
+                    opened = true
+                    break
+                end
+                if not S.running then
+                    S.farmWalking = false
+                    return false
+                end
+                -- A refused door is nearly always one of two curable things, and
+                -- they have different answers.  Something still alive in the room
+                -- behind us holds the door shut by design, so go back and kill it.
+                -- If the run is not open at all, the town pull is still in flight
+                -- or the server has not let go of the room we left, and both of
+                -- those clear from the lobby.  Neither is the career limit, which
+                -- is what the rotation used to conclude - and it cost the top stage
+                -- every time.
+                --
+                -- What must NOT happen is a trip to town while the run is live:
+                -- standing in the lobby abandons the challenge outright.  Measured
+                -- with that mistake in place, every lap climbed to stage 10, the
+                -- retry walked to the lobby, the server reset the run to 0, and a
+                -- 300s window earned nothing at all.
+                if runStage() > 0 and #enemyList(runStage()) > 0 then
+                    clearFrontier(14)
+                elseif runStage() <= 0 then
+                    returnToLobby(4)
+                else
+                    task.wait(0.4)
+                end
+            end
+            if not opened then
+                S.note = ("farm: the run stalled at stage %d (door %d refused)")
+                    :format(runStage(), k)
                 S.farmWalking = false
                 return false
             end
@@ -1128,12 +1440,21 @@ local function CreateMagicLootHub()
     -- for a short window and then lets holdStage carry on regardless.
     local function enterStage(n)
         S.farmWalking = true
-        if not awaitStage(n, 5) then
-            S.note = ("farm: stage %d never streamed in"):format(n)
+        -- Walk first, stream second.  awaitStage brings a far room in by standing
+        -- in it, and doing that *before* the run has opened it is a trap: the
+        -- server registered us in stage 12 (DungeonAggroStage jumped straight to
+        -- 12 with the run still at 0), rewound the challenge and pulled us back to
+        -- town - which is exactly the reported "walks to the stage 1 gate and gets
+        -- yanked to some other position" bug, and it cost a 300s window every
+        -- gold piece it should have earned.  The corridor walk streams every room
+        -- it passes through anyway, so by the time the run reaches n the model is
+        -- normally already here.
+        if runStage() < n and not openRunTo(n) then
             S.farmWalking = false
             return false
         end
-        if runStage() < n and not openRunTo(n) then
+        if not awaitStage(n, 5) then
+            S.note = ("farm: stage %d never streamed in"):format(n)
             S.farmWalking = false
             return false
         end
@@ -1209,6 +1530,7 @@ local function CreateMagicLootHub()
     --     a whole wave period before we call a stage barren;
     --   * leaving as soon as the wave dies abandons 11 drops, so the hold also
     --     stays while there is loot on the ground and pickup is on.
+    local dpsAttack = 0            -- Attack value the dps estimate was taken at
     local function holdStage(stage)
         local deadline  = os.clock() + math.max(5, num(S.stageSeconds, 70))
         local spawnGive = os.clock() + math.max(1, num(S.spawnWait, 36))
@@ -1216,15 +1538,29 @@ local function CreateMagicLootHub()
         local sawEnemy  = false
         local sawAny    = false     -- did anything at all spawn in this window
         local lastCash  = 0
+        local emptySince = nil      -- clock since the room went completely quiet
         S.farmClears = 0
 
-        -- Damage meter.  Measured: a stage-6 wave is 4 x 2.5M HP and dies in under
-        -- 6s, so ~1.7M dps; stage 11's five monsters lost nothing in 45s.  Summing
-        -- our room's enemy health each tick gives the rate, and the rate turns the
-        -- next room's health bar into an ETA - which is the only honest way to know
-        -- a stage is out of reach *before* burning a whole window on it.
-        local lastSum, fightSecs, damage = nil, 0, 0
+        -- Damage meter.  The v3 version only counted health that dropped while an
+        -- enemy was still listed, so the killing blow - which is most of the wave's
+        -- health when a wave dies inside one 0.2s tick - was thrown away.  It read
+        -- 3.5M/s against a real 4e9/s, the ETA rule believed it, and the farm
+        -- capped itself at stage 6 (stage 7's 200M "needed" 56s).  Track health per
+        -- enemy instead and treat a vanished enemy as having gone to zero, so the
+        -- kill lands in the total.
+        local prevHP, prevSum = {}, 0
+        local fightSecs, damage = 0, 0
         local lastTick = os.clock()
+
+        -- A rebirth or a wand swap changes damage by orders of magnitude, and a
+        -- peak-hold meter would keep quoting the old number forever.  Re-base it
+        -- whenever Attack moves more than a fifth either way.
+        local atkNow = attr(1)
+        if dpsAttack <= 0 or atkNow <= 0
+           or atkNow > dpsAttack * 1.2 or atkNow < dpsAttack * 0.8 then
+            dpsAttack = atkNow
+            S.dps = 0
+        end
 
         while S.autoFarm and S.running and os.clock() < deadline do
             if guardHealth(stage) then
@@ -1254,14 +1590,14 @@ local function CreateMagicLootHub()
             local up   = #mobs
             local loot = #dropList()
 
-            -- The temp bag is 5-7 slots and one wave drops 11 items, so it fills
+            -- The temp bag is 5-8 slots and one wave drops 11 items, so it fills
             -- mid-hold.  Deferring the flush until the window ends loses every
             -- drop after that point: measured, five items sat on the floor for
-            -- 30s with LimitBagUsed pinned at 7 and gold unchanged.  Cash out the
-            -- moment it is full.  The flush also ends the run, so hand straight
-            -- back to the rotation and let it re-walk the corridor.
-            if S.autoSell and limitBagUsed() >= tempCap()
-               and os.clock() - lastCash > 3 then
+            -- 30s with LimitBagUsed pinned and gold unchanged.  Cash out the
+            -- moment the server says we are actually full.  The flush also ends
+            -- the run, so hand straight back to the rotation and let it re-walk
+            -- the corridor.
+            if S.autoSell and bagFull() and os.clock() - lastCash > 3 then
                 lastCash = os.clock()
                 S.farmPhase = ("stage %d - temp bag full (%d/%d), cashing out")
                     :format(stage, limitBagUsed(), tempCap())
@@ -1273,44 +1609,82 @@ local function CreateMagicLootHub()
             end
 
             -- Health pool of this room's wave, and how fast it is dropping.
-            local sum = 0
-            for _, e in ipairs(mobs) do sum += e.hum.Health end
+            local sum, strongest = 0, 0
+            local nowHP = {}
+            for _, e in ipairs(mobs) do
+                sum += e.hum.Health
+                nowHP[e.model] = e.hum.Health
+                if e.hum.Health > strongest then strongest = e.hum.Health end
+            end
             local dt = os.clock() - lastTick
             lastTick = os.clock()
-            if up > 0 then
-                if lastSum and up > 0 and sum < lastSum then damage += (lastSum - sum) end
-                fightSecs += dt
-                if fightSecs > 1.5 and damage > 0 then
-                    local rate = damage / fightSecs
-                    -- Exponential average so one lucky wave does not set the bar.
-                    S.dps = (S.dps > 0) and (S.dps * 0.7 + rate * 0.3) or rate
-                end
-                lastSum = sum
-            else
-                lastSum = nil
-            end
 
-            -- The give-up rule.  If this wave's remaining health divided by the
-            -- damage we are actually doing needs longer than maxClearSecs, stop:
-            -- there is nothing to be gained by standing there, and the caller
-            -- collects, sells and reloops on a stage it can finish.
-            if up > 0 and S.dps > 0 and fightSecs > 3 then
-                local eta = sum / S.dps
-                if eta > math.max(5, num(S.maxClearSecs, 60)) then
-                    S.note = ("farm: stage %d wave is %s HP at %s dps - %ds to clear, too slow")
-                        :format(stage, short(sum), short(S.dps), math.floor(eta))
-                    S.farmPhase = ("stage %d too tanky (%ds to clear) - cashing out")
-                        :format(stage, math.floor(eta))
-                    return "tanky"
+            -- Anything we saw last tick that is missing or lower now cost it that
+            -- much health; a model that is simply gone died, so its whole last
+            -- reading counts.  That is the tick where nearly all of the damage in
+            -- a one-shot wave actually happens.
+            local dealt = 0
+            for model, was in pairs(prevHP) do
+                local isNow = nowHP[model] or 0
+                if was > isNow then dealt += (was - isNow) end
+            end
+            if prevSum > 0 then
+                damage += dealt
+                fightSecs += dt
+                -- Peak, not average.  The meter can only ever *under*-read: a wave
+                -- smaller than one tick of our damage caps `dealt` at its own
+                -- health, so stage 2's 247 HP wave measured 617/s and the running
+                -- average carried that lie into the ETA rule, which then called
+                -- every room above 6 too tanky.  Damage capability does not drop
+                -- between waves, so keep the best rate seen and let the attack
+                -- floor in the ETA rule cover the cold start.
+                if fightSecs > 1.0 and damage > 0 then
+                    local rate = damage / fightSecs
+                    if rate > S.dps then S.dps = rate end
+                end
+            end
+            prevHP, prevSum = nowHP, sum
+
+            -- The give-up rule is arithmetic, not a stopwatch.  Waiting out a
+            -- 35s window to discover a room is unfarmable costs 35s every lap;
+            -- the wave's health divided by our damage answers it on the first
+            -- tick.  Attack (Attrs.1) x ~3 is the fallback until a wave has
+            -- actually been measured - live readings were 3.3-5e9/s against an
+            -- Attack of 1.12e9 - so even a room entered cold is judged at once.
+            -- Stage 11 is the case that matters: 442B of health is ~130s at our
+            -- damage, and it is now abandoned in the first fraction of a second
+            -- instead of after a full window of chipping at it.
+            if up > 0 then
+                -- Attack x2 is the floor: measured 2e10/s against an Attack of
+                -- 8.3e9, and 3.3-5e9/s against 1.12e9 earlier in the session, so
+                -- the ratio holds across wands.  Using it as a floor means a
+                -- rebirth or a new wand is priced in immediately, with no window
+                -- spent re-measuring, and a stale peak can never be the only
+                -- number the decision rests on.
+                local rate = math.max(S.dps, attr(1) * 2)
+                local cap  = math.max(5, num(S.etaLimit, 35))
+                if rate > 0 then
+                    local eta = sum / rate
+                    if eta > cap then
+                        S.note = ("farm: stage %d wave is %s HP (biggest %s) at %s dps"
+                               .. " - %ds to clear, over the %ds limit")
+                            :format(stage, short(sum), short(strongest), short(rate),
+                                    math.floor(eta), math.floor(cap))
+                        S.farmPhase = ("stage %d too tanky (%ds to clear) - cashing out")
+                            :format(stage, math.floor(eta))
+                        return "tanky"
+                    end
                 end
             end
 
             if up > 0 then
                 sawEnemy = true
                 sawAny   = true
+                emptySince = nil
                 noteStageAlive(stage)
             else
                 if loot > 0 then noteStageAlive(stage) end   -- a wave died here
+                emptySince = (loot == 0) and (emptySince or os.clock()) or nil
                 if sawEnemy then
                     sawEnemy = false
                     S.farmClears += 1
@@ -1334,7 +1708,29 @@ local function CreateMagicLootHub()
                 end
             end
 
-            local lootLeft = S.autoPickup and loot > 0 and (tempCap() - limitBagUsed()) > 0
+            -- Dead time is the only free flush in the game.  A stage-11 wave drops
+            -- 11 items into an 8-slot bag and the room then sits empty for ~30s
+            -- while the respawn timer runs; the corridor re-walk costs ~20s of
+            -- that.  So once the frontier room is genuinely quiet - no enemies, no
+            -- loot left - and the bag could not take another wave anyway, bank it
+            -- and hand back to the rotation.  Two guards matter: only in the
+            -- frontier room (banking while walking the corridor churns the run for
+            -- one item), and only when nearly full (a bag with room to spare is
+            -- worth more than the flush, since the flush costs the whole walk).
+            if S.autoSell and emptySince and os.clock() - emptySince > 3
+               and stage == runStage()
+               and limitBagUsed() >= math.max(2, tempCap() - 2)
+               and os.clock() - lastCash > 5 then
+                lastCash = os.clock()
+                S.farmPhase = ("stage %d empty - banking %d item(s) now")
+                    :format(stage, limitBagUsed())
+                sellEverything()
+                if limitBagUsed() <= 0 then
+                    return S.farmClears > 0 and "cleared" or "flushed"
+                end
+            end
+
+            local lootLeft = S.autoPickup and loot > 0 and not bagFull()
             if S.farmClears >= wanted and not lootLeft then return "cleared" end
 
             S.farmPhase = ("stage %d - %d up, %s HP, %d loot, %d/%d cleared, %ds left")
@@ -1372,11 +1768,13 @@ local function CreateMagicLootHub()
         local best    = 0             -- highest stage we have actually cleared in
         local wins    = 0             -- clean clears at the cap, earns a re-probe
         local failAt  = {}
+        local walkFails = 0           -- corridor stalls below the target
         while S.running and not Fluent.Unloaded do
             if not S.autoFarm then
                 S.farmPhase = "off"
                 discovered, target, best = false, 0, 0
                 hardCap, failAt, wins = MAX_STAGE, {}, 0
+                walkFails = 0
                 task.wait(0.3)
                 continue
             end
@@ -1397,6 +1795,7 @@ local function CreateMagicLootHub()
             S.farmPhase = ("entering stage %d"):format(target)
             if enterStage(target) then
                 failAt[target] = nil
+                walkFails = 0
                 local how = holdStage(target)
                 if how == "cleared" then
                     best = math.max(best, target)
@@ -1423,19 +1822,21 @@ local function CreateMagicLootHub()
                 end
 
                 if how == "tanky" then
-                    -- This room is above our damage: either nothing died in a
-                    -- whole window, or the wave's health divided by our measured
-                    -- dps needed longer than maxClearSecs.  The sequence the user
-                    -- asked for is stop -> collect -> sell -> reloop, and it is
-                    -- also the right one: the loot already on the floor is worth
-                    -- more than another minute of chipping at a 250M health bar.
+                    -- This room is above our damage: the wave's health divided by
+                    -- our measured dps needs longer than the ETA limit.  The
+                    -- sequence the user asked for is stop -> collect -> sell ->
+                    -- reloop, and it is also the right one: the loot already on
+                    -- the floor is worth more than another minute of chipping at
+                    -- a 442B health bar.  pickupPass takes the dearest drops
+                    -- first, so a short sweep still banks the valuable half.
                     hardCap = math.max(first, target - 1)
                     wins = 0
                     local back = math.max(first, math.min(hardCap, best > 0 and best or hardCap))
 
                     S.farmPhase = ("stage %d too tanky - collecting the loot"):format(target)
                     local sweep = os.clock()
-                    while S.autoPickup and os.clock() - sweep < 4 do
+                    while S.autoPickup and os.clock() - sweep < 6 do
+                        if bagFull() then break end
                         if pickupPass() == 0 and #dropList() == 0 then break end
                         task.wait(0.2)
                     end
@@ -1452,39 +1853,74 @@ local function CreateMagicLootHub()
                         :format(target, back)
                     target = back
                 elseif how == "flushed" then
-                    -- The bag filled and was banked mid-fight, which ended the
-                    -- run.  Stay on this room - it is the best one we can clear -
-                    -- and let the top of the loop re-walk the corridor to it.
+                    -- The bag filled and was banked, which ended the run.  Aim at
+                    -- the ceiling again rather than at this room: a flush says
+                    -- nothing about how hard the room was, and treating it as the
+                    -- new home pinned a whole 300s test to stage 6 (a 10M wave,
+                    -- ~600K/lap) when stage 11's 425B wave was clearing in 25s for
+                    -- ~50M.  The ETA rule re-judges the top room in one tick, so
+                    -- aiming high costs nothing when it is out of reach.
                     best = math.max(best, target)
+                    target = last
                     S.farmPhase = ("sold mid-run - walking back to stage %d"):format(target)
                 elseif how == "barren" and target < last then
                     target += 1                      -- no wave here, push on
-                elseif how == "cleared" and target < last then
-                    target += 1                      -- one room per lap, upward
+                elseif how == "cleared" then
+                    -- Straight back to the ceiling.  Climbing one room per lap was
+                    -- how the ceiling used to be discovered, but the doors and the
+                    -- ETA rule both answer that in a fraction of a second now, and
+                    -- the corridor has to be walked through every room in between
+                    -- either way - so a lap that stops at stage 7 just throws away
+                    -- the four rooms above it.
+                    target = last
                 end
             else
-                -- A door that will not open twice in a row is the career limit,
-                -- so stop trying to climb past it and settle on the room below.
-                failAt[target] = (failAt[target] or 0) + 1
-                if failAt[target] >= 2 and target > first then
-                    hardCap = math.max(first, target - 1)
-                    S.note = ("farm: stage %d will not open, holding at %d")
-                        :format(target, hardCap)
-                end
-                -- Do not fall back to wherever the run happens to be after every
-                -- hiccup.  A flush leaves run=0, and collapsing the target onto it
-                -- sent the rotation back to stage 1 to fight rooms whose drops are
-                -- worth a thousandth of the top room's (measured: 20s held in
-                -- stage 2 for 495 HP of monsters, straight after clearing 10).
-                -- Three failures in a row is not a hiccup though, and farming the
-                -- room the run did reach beats retrying one climb forever.
-                if (failAt[target] or 0) >= 3 then
-                    local dropped = target
-                    target = math.clamp(math.max(runStage(), first), first, hardCap)
-                    failAt[dropped] = 0
-                    S.note = ("farm: could not walk to stage %d, farming %d for now")
-                        :format(dropped, target)
+                -- A door refuses for two completely different reasons and they
+                -- must not be conflated.  If the run had already reached the room
+                -- *below* the target, then the door in front of the target is the
+                -- career gate and the ceiling really is one lower.  If the walk
+                -- died further down the corridor - which is exactly what a flush
+                -- taken mid-lap looks like, the town pull landing while we stand
+                -- on door 1 - then nothing whatsoever has been learned about the
+                -- top room, and lowering the ceiling for it threw stage 11 away:
+                -- measured 11 -> 10 -> 9 over 60s while the run flag sat at 0 and
+                -- stage 11 was still clearing a 425B wave in 25s.
+                local reached = runStage()
+                if reached >= target - 1 then
+                    failAt[target] = (failAt[target] or 0) + 1
+                    if failAt[target] >= 2 and target > first then
+                        hardCap = math.max(first, target - 1)
+                        S.note = ("farm: stage %d will not open, holding at %d")
+                            :format(target, hardCap)
+                    end
+                    -- Do not fall back to wherever the run happens to be after
+                    -- every hiccup.  A flush leaves run=0, and collapsing the
+                    -- target onto it sent the rotation back to stage 1 to fight
+                    -- rooms worth a thousandth of the top room's drops (measured:
+                    -- 20s held in stage 2 for 495 HP of monsters, straight after
+                    -- clearing 10).  Three failures in a row is not a hiccup
+                    -- though, and farming the room the run did reach beats
+                    -- retrying one climb forever.
+                    if (failAt[target] or 0) >= 3 then
+                        local dropped = target
+                        target = math.clamp(math.max(reached, first), first, hardCap)
+                        failAt[dropped] = 0
+                        S.note = ("farm: could not walk to stage %d, farming %d for now")
+                            :format(dropped, target)
+                    else
+                        target = math.clamp(math.max(target, best), first, hardCap)
+                    end
                 else
+                    -- Corridor hiccup below the target: keep the ceiling, and every
+                    -- third try reset the run properly so the next walk starts from
+                    -- a town the server agrees we are in.
+                    walkFails += 1
+                    S.note = ("farm: the walk stalled at stage %d on the way to %d,"
+                           .. " retrying (%d)"):format(reached, target, walkFails)
+                    if walkFails % 3 == 0 then
+                        S.farmPhase = "corridor walk stalled - resetting the run"
+                        endRun()
+                    end
                     target = math.clamp(math.max(target, best), first, hardCap)
                 end
                 task.wait(0.5)
@@ -1538,6 +1974,9 @@ local function CreateMagicLootHub()
         if not ok then return false, tostring(res) end
         if res ~= true then return false, "server rejected" end
         S.bought += 1
+        local row = Conf.weaponConf[id]
+        hookPush((":crossed_swords: Bought **%s**")
+            :format(en(row and row.ZhName, "wand " .. tostring(id))))
         if S.equipAfterBuy then task.spawn(equipWand, id) end
         return true, "ok"
     end
@@ -1579,7 +2018,7 @@ local function CreateMagicLootHub()
     end
 
     local function rebirthOnce()
-        local _, _, need, eligible = rebirthStatus()
+        local count, level, need, eligible = rebirthStatus()
         if not need then return false, "already max rebirth" end
         if not eligible then return false, "level below " .. need end
         if not allow(NetMsg.PLAYER_REBIRTH) then return false, "capped" end
@@ -1587,6 +2026,10 @@ local function CreateMagicLootHub()
         if not ok then return false, tostring(res) end
         if res ~= true then return false, "server rejected" end
         S.rebirths += 1
+        if S.hookRebirth then
+            hookPush((":sparkles: **Rebirth %d** at level %d  (%d this session)")
+                :format(count + 1, level, S.rebirths))
+        end
         return true, "ok"
     end
 
@@ -1635,11 +2078,40 @@ local function CreateMagicLootHub()
     end
 
     ------------------------------------------------------------------
+    -- 16b. OneClick  (the whole economy loop behind one switch)
+    ------------------------------------------------------------------
+    -- The loop the game actually rewards is: walk the corridor up to the best
+    -- room we can clear -> kill -> take the dearest drops -> flush (which ends
+    -- the run) -> sell -> walk it again, with training taps riding along the
+    -- whole time because they cost nothing but request budget and gain is
+    -- server-side.  None of those pieces is useful alone, and every one of them
+    -- was a separate switch on a separate tab.  So this drives them together and
+    -- keeps re-asserting: the sub-toggles can be flipped while it runs, and
+    -- nothing can drift off because some other worker turned it off.
+    local function oneClickApply()
+        local on = S.oneClick
+        S.autoFarm    = on and S.ocFarm
+        S.autoPickup  = on and S.ocCollect
+        S.autoSell    = on and S.ocSell
+        S.autoTrain   = on and S.ocTrain
+        S.autoBuyWand = on and S.ocWand
+        S.autoRebirth = on and S.ocRebirth
+        if on then
+            -- The farm drives its own attacks, but hover is what keeps the melee
+            -- waves off us (measured minHP 100 across full runs), and the flush
+            -- is the only way loot picked up inside a stage ever becomes gold.
+            S.hover     = true
+            S.sellFlush = true
+        end
+    end
+
+
+    ------------------------------------------------------------------
     -- 17. Window
     ------------------------------------------------------------------
     local Window = Fluent:CreateWindow({
         Title       = "Magic Loot",
-        SubTitle    = "Fluent hub v3",
+        SubTitle    = "Fluent hub v4",
         TabWidth    = 140,
         Size        = UDim2.fromOffset(600, 520),
         Acrylic     = false,
@@ -1648,87 +2120,65 @@ local function CreateMagicLootHub()
     })
 
     local Tabs = {
+        OneClick = Window:AddTab({ Title = "OneClick", Icon = "zap" }),
         Combat   = Window:AddTab({ Title = "Combat",   Icon = "crosshair" }),
         Farm     = Window:AddTab({ Title = "Farm",     Icon = "swords" }),
         Bag      = Window:AddTab({ Title = "Bag",      Icon = "package" }),
         Train    = Window:AddTab({ Title = "Train",    Icon = "dumbbell" }),
         Shop     = Window:AddTab({ Title = "Shop",     Icon = "shopping-cart" }),
+        Webhook  = Window:AddTab({ Title = "Webhook",  Icon = "bell" }),
         Stats    = Window:AddTab({ Title = "Stats",    Icon = "bar-chart-2" }),
         Misc     = Window:AddTab({ Title = "Misc",     Icon = "wrench" }),
         Settings = Window:AddTab({ Title = "Settings", Icon = "settings" }),
     }
 
-    -- Every numeric control is a free-text box with no upper bound, per request.
-    -- Callbacks only assign into S, never touch the network (capability bug).
-    local function numberBox(parent, id, title, desc, key)
-        local default = tostring(S[key])
-        parent:AddInput(id, {
-            Title       = title,
-            Description = desc,
-            Default     = default,
-            Placeholder = default,
-            Numeric     = true,
-            Finished    = false,
-            Callback    = function(v)
-                local n = tonumber(v)
-                if n then S[key] = n end
-            end,
-        })
+    ------------------------------------------------------------------
+    -- 17b. OneClick tab
+    ------------------------------------------------------------------
+    local oneSec  = Tabs.OneClick:AddSection("OneClick")
+    local oneInfo = oneSec:AddParagraph({ Title = "Status", Content = "off" })
+
+    oneSec:AddToggle("OneClick", {
+        Title   = "OneClick",
+        Default = false,
+    }):OnChanged(function(v) S.oneClick = v end)
+
+    local incSec = Tabs.OneClick:AddSection("Include")
+
+    for _, item in ipairs({
+        { "OcFarm",    "Auto farm",     "ocFarm" },
+        { "OcCollect", "Auto collect",  "ocCollect" },
+        { "OcSell",    "Auto sell",     "ocSell" },
+        { "OcTrain",   "Auto train",    "ocTrain" },
+        { "OcWand",    "Auto buy wand", "ocWand" },
+        { "OcRebirth", "Auto rebirth",  "ocRebirth" },
+    }) do
+        local key = item[3]
+        incSec:AddToggle(item[1], { Title = item[2], Default = true })
+            :OnChanged(function(v) S[key] = v end)
     end
+
 
     ------------------------------------------------------------------
     -- 18. Combat tab
     ------------------------------------------------------------------
-    local auraSec = Tabs.Combat:AddSection("Kill aura")
-
-    auraSec:AddParagraph({
-        Title   = "Read me once",
-        Content = "This drives the game's own input simulator, so the server\n"
-               .. "builds the release payload exactly like a real press. Damage\n"
-               .. "is decided server-side: 42 presses/sec cleared a stage in the\n"
-               .. "same time as 1 press/sec, so there is no damage multiplier to\n"
-               .. "give you. What this does buy you is that nothing is ever left\n"
-               .. "alive or waiting - it targets every tagged enemy the moment it\n"
-               .. "spawns instead of waiting for it to walk into 60 studs.",
-    })
-
+    local auraSec  = Tabs.Combat:AddSection("Kill aura")
     local auraInfo = auraSec:AddParagraph({ Title = "Live", Content = "reading..." })
 
     auraSec:AddToggle("KillAura", {
-        Title       = "Kill aura",
-        Description = "Attacks the nearest live enemy from CollectionService \"Enemy\"",
-        Default     = false,
+        Title   = "Kill aura",
+        Default = false,
     }):OnChanged(function(v) S.killAura = v end)
 
-    numberBox(auraSec, "AttacksPerSec", "Attacks per second",
-        "Unbounded. Effective rate is still capped by the request budget in Misc.",
-        "attacksPerSec")
-
-    numberBox(auraSec, "AuraRange", "Target range (studs)",
-        "How far away an enemy may be before we bother with it",
-        "auraRange")
-
     auraSec:AddToggle("SnapToTarget", {
-        Title       = "Snap next to the target",
-        Description = "The game only accepts targets inside ~60 studs, so we close the gap",
-        Default     = true,
+        Title   = "Snap to target",
+        Default = true,
     }):OnChanged(function(v) S.snapToTarget = v end)
 
-    numberBox(auraSec, "SnapDistance", "Snap standoff (studs)",
-        "How close to stand when snapping. Ignored while Hover is on.",
-        "snapDistance")
-
     auraSec:AddToggle("Hover", {
-        Title       = "Hover above the enemies",
-        Description = "Floats over the wave so melee swings cannot reach you",
-        Default     = true,
+        Title   = "Hover above the enemies",
+        Default = true,
     }):OnChanged(function(v) S.hover = v end)
-
-    numberBox(auraSec, "HoverHeight", "Hover height (studs above the floor)",
-        "The combat volume is 25.9 studs tall, so anything over 22 puts you\n"
-     .. "outside the region the server tests and the stage stops spawning.\n"
-     .. "Clamped to that ceiling automatically.",
-        "hoverHeight")
 
     auraSec:AddDropdown("AuraSlots", {
         Title   = "Slots to press",
@@ -1747,55 +2197,20 @@ local function CreateMagicLootHub()
     ------------------------------------------------------------------
     -- 19. Farm tab
     ------------------------------------------------------------------
-    local farmSec  = Tabs.Farm:AddSection("Sequential career farm")
+    local farmSec  = Tabs.Farm:AddSection("Career farm")
     local farmInfo = farmSec:AddParagraph({ Title = "Status", Content = "idle" })
 
-    farmSec:AddParagraph({
-        Title   = "How entry works",
-        Content = "The game has no client \"enter stage\" message - the server\n"
-               .. "region-tests your position, so we place you inside the stage's\n"
-               .. "combat volume and wait for DungeonAggroStage to flip. Waves only\n"
-               .. "spawn in the room the *run* has reached (InDungeonChallenge), so\n"
-               .. "the rotation walks the corridor forward one front door at a time,\n"
-               .. "1 -> 2 -> 3 ..., and holds the top room. If a wave would take\n"
-               .. "longer than the limit below to kill, the farm stops there, picks\n"
-               .. "the loot up, sells it, ends the run and loops back down to the\n"
-               .. "highest stage it can actually finish.",
-    })
-
     farmSec:AddToggle("AutoFarm", {
-        Title       = "Auto farm",
-        Description = "Walks the stage list in order and re-enters after selling or dying",
-        Default     = false,
+        Title   = "Auto farm",
+        Default = false,
     }):OnChanged(function(v) S.autoFarm = v end)
-
-    numberBox(farmSec, "StageStart", "First stage", "Where the rotation starts", "stageStart")
-    numberBox(farmSec, "StageEnd", "Last stage",
-        "0 = CareerMaxStage + 1, so the run also pushes your career forward", "stageEnd")
-    numberBox(farmSec, "ClearsPerStage", "Waves to clear per stage",
-        "Advance once this many waves have been wiped", "clearsPerStage")
-    numberBox(farmSec, "MaxClearSecs", "Give up on a wave over (s)",
-        "Health of the wave divided by the damage we are actually doing. Over\n"
-     .. "this many seconds the farm stops, collects the loot, sells it, ends\n"
-     .. "the run and drops back to a stage it can clear. 60 by default.",
-        "maxClearSecs")
-    numberBox(farmSec, "SpawnWait", "Give up waiting after (s)",
-        "Waves land every ~32s, so anything under ~36 skips live stages by mistake",
-        "spawnWait")
-    numberBox(farmSec, "StageSeconds", "Seconds per stage (timeout)",
-        "Hard cap before moving on, even with a wave alive or loot still down", "stageSeconds")
-    numberBox(farmSec, "RetreatHP", "Retreat at HP %",
-        "Teleports to the stage safe area below this", "retreatHP")
-    numberBox(farmSec, "ReturnHP", "Re-enter at HP %",
-        "Goes back in once health recovers to this", "returnHP")
 
     local rebirthSec  = Tabs.Farm:AddSection("Rebirth")
     local rebirthInfo = rebirthSec:AddParagraph({ Title = "Rebirth", Content = "reading..." })
 
     rebirthSec:AddToggle("AutoRebirth", {
-        Title       = "Auto rebirth",
-        Description = "Rebirths as soon as your level reaches the next LvNeed",
-        Default     = false,
+        Title   = "Auto rebirth",
+        Default = false,
     }):OnChanged(function(v) S.autoRebirth = v end)
 
     ------------------------------------------------------------------
@@ -1804,73 +2219,30 @@ local function CreateMagicLootHub()
     local dropSec = Tabs.Bag:AddSection("Pickup")
 
     dropSec:AddToggle("AutoPickup", {
-        Title       = "Auto pickup (walks itself into range)",
-        Description = "Teleports inside the 10-stud prompt radius, then fires DROP_PICKUP once",
-        Default     = false,
+        Title   = "Auto collect (dearest drop first)",
+        Default = false,
     }):OnChanged(function(v) S.autoPickup = v end)
-
-    numberBox(dropSec, "PickupPerSec", "Scan passes per second",
-        "How often to sweep Workspace.DropsClient", "pickupPerSec")
-
-    dropSec:AddParagraph({
-        Title   = "Why v3's pickup landed 4 items out of 178 requests",
-        Content = "The game picks drops up with a ProximityPrompt, and the server\n"
-               .. "enforces the same rules: the drop must have landed, its Stage\n"
-               .. "attribute must equal your DungeonAggroStage, you must be within\n"
-               .. "10 studs, and the temp bag must have room (capacity is Bag.5,\n"
-               .. "which is 4). Blind spam fails all four. This version checks\n"
-               .. "each one, teleports into range, and fires a single request.",
-    })
 
     local sellSec  = Tabs.Bag:AddSection("Selling")
     local sellInfo = sellSec:AddParagraph({ Title = "Bag", Content = "reading..." })
 
-    sellSec:AddParagraph({
-        Title   = "The full loot chain, verified live",
-        Content = "1. DROP_PICKUP puts the item in a server-side temp bag, and\n"
-               .. "   Player.LimitBagUsed counts it. It holds 4.\n"
-               .. "2. DUNGEON_RETURN_TOWN flushes it into your real bag in about\n"
-               .. "   a quarter of a second - that is the \"go back to load your\n"
-               .. "   items\" step, and it needs no walking, only the message. It\n"
-               .. "   does end the run, so the farm re-enters afterwards.\n"
-               .. "3. SELL_MATERIAL {onlyIDList=...} pays out at once (a test of\n"
-               .. "   18 rows returned 2,332,883 gold).\n"
-               .. "With auto farm on, this runs between stages the moment the\n"
-               .. "temp bag fills, so nothing is ever left behind.",
-    })
-
     sellSec:AddToggle("AutoSell", {
-        Title       = "Auto sell materials",
-        Description = "Flushes the temp bag, then sells every unlocked material",
-        Default     = false,
+        Title   = "Auto sell materials",
+        Default = false,
     }):OnChanged(function(v) S.autoSell = v end)
 
-    numberBox(sellSec, "SellSeconds", "Seconds between sell passes",
-        "Lower = sells sooner after each pickup", "sellSeconds")
-
     sellSec:AddToggle("SellFlush", {
-        Title       = "Flush temp bag first (returns you to town)",
-        Description = "Required for anything picked up inside a stage; farm re-enters after",
-        Default     = true,
+        Title   = "Flush temp bag first",
+        Default = true,
     }):OnChanged(function(v) S.sellFlush = v end)
 
     sellSec:AddToggle("KeepAlchemy", {
-        Title       = "Keep alchemy recipe materials",
-        Description = "Skips anything marked by the alchemy system",
-        Default     = true,
+        Title   = "Keep alchemy materials",
+        Default = true,
     }):OnChanged(function(v) S.keepAlchemy = v end)
 
-    sellSec:AddButton({
-        Title       = "Sell now",
-        Description = "Flush + sell immediately, once",
-        Callback    = function() S.sellNow = true end,
-    })
-
-    sellSec:AddButton({
-        Title       = "Flush temp bag now",
-        Description = "Fires DUNGEON_RETURN_TOWN so pending loot lands in your bag",
-        Callback    = function() S.flushNow = true end,
-    })
+    sellSec:AddButton({ Title = "Sell now", Callback = function() S.sellNow = true end })
+    sellSec:AddButton({ Title = "Flush temp bag now", Callback = function() S.flushNow = true end })
 
     ------------------------------------------------------------------
     -- 21. Train tab
@@ -1878,25 +2250,10 @@ local function CreateMagicLootHub()
     local trainSec  = Tabs.Train:AddSection("Training")
     local trainInfo = trainSec:AddParagraph({ Title = "Live", Content = "reading..." })
 
-    trainSec:AddParagraph({
-        Title   = "What changed",
-        Content = "v2 awaited every tap, and Roblox serialises RemoteFunction\n"
-               .. "calls per client, so it ran at 1/ping. Taps are now fired on\n"
-               .. "their own threads, so the rate is limited by the request budget\n"
-               .. "instead of latency. The zone auto-move is gone: gain per tap\n"
-               .. "comes from your wand's trainBase server-side, and standing in a\n"
-               .. "training ground actively blocks manual taps.",
-    })
-
     trainSec:AddToggle("AutoTrain", {
-        Title       = "Auto train",
-        Description = "No animation, no interval to tune, works anywhere outside a train zone",
-        Default     = false,
+        Title   = "Auto train",
+        Default = false,
     }):OnChanged(function(v) S.autoTrain = v end)
-
-    numberBox(trainSec, "TapsPerSec", "Taps per second",
-        "Unbounded here; the request budget in Misc is the real ceiling",
-        "tapsPerSec")
 
     ------------------------------------------------------------------
     -- 22. Shop tab
@@ -1916,24 +2273,61 @@ local function CreateMagicLootHub()
     }):OnChanged(function(v) S.wandMode = v end)
 
     wandSec:AddDropdown("WandChoice", {
-        Title       = "Wand",
-        Description = "Only used in \"Choose wand to buy\" mode",
-        Values      = wandNames,
-        Multi       = false,
-        Default     = 1,
+        Title   = "Wand",
+        Values  = wandNames,
+        Multi   = false,
+        Default = 1,
     }):OnChanged(function(v) S.wandChoice = v end)
 
     wandSec:AddToggle("AutoBuyWand", {
-        Title       = "Auto buy when affordable",
-        Description = "Gold purchases only - Robux and event wands are skipped",
-        Default     = false,
+        Title   = "Auto buy when affordable",
+        Default = false,
     }):OnChanged(function(v) S.autoBuyWand = v end)
 
     wandSec:AddToggle("EquipAfterBuy", {
-        Title       = "Equip after buying",
-        Description = "Sends EQUIP_SHOP_EQUIP with the same payload shape as the buy call",
-        Default     = true,
+        Title   = "Equip after buying",
+        Default = true,
     }):OnChanged(function(v) S.equipAfterBuy = v end)
+
+    ------------------------------------------------------------------
+    -- 22b. Webhook tab
+    ------------------------------------------------------------------
+    local hookSec  = Tabs.Webhook:AddSection("Discord webhook")
+    local hookInfo = hookSec:AddParagraph({ Title = "Status", Content = "no URL set" })
+
+    -- The one text field left in the hub: it cannot be a toggle, and it is the
+    -- user's own endpoint.  Nothing is sent anywhere until it is filled in.
+    hookSec:AddInput("HookUrl", {
+        Title       = "Webhook URL",
+        Default     = "",
+        Placeholder = "https://discord.com/api/webhooks/...",
+        Numeric     = false,
+        Finished    = true,
+        Callback    = function(v) S.hookUrl = tostring(v or ""):gsub("%s+", "") end,
+    })
+
+    local rarityValues = {}
+    for i = 1, #RARITY do
+        rarityValues[i] = ("%d - %s and above"):format(i, RARITY[i])
+    end
+
+    hookSec:AddDropdown("HookRarity", {
+        Title   = "Notify from rarity",
+        Values  = rarityValues,
+        Multi   = false,
+        Default = 6,
+    }):OnChanged(function(v)
+        S.hookRarity = tonumber(tostring(v):match("^(%d+)")) or 6
+    end)
+
+    hookSec:AddToggle("HookItems",   { Title = "Notify on item",    Default = true })
+        :OnChanged(function(v) S.hookItems = v end)
+    hookSec:AddToggle("HookRebirth", { Title = "Notify on rebirth", Default = true })
+        :OnChanged(function(v) S.hookRebirth = v end)
+    hookSec:AddToggle("HookSales",   { Title = "Notify on sale",    Default = true })
+        :OnChanged(function(v) S.hookSales = v end)
+
+    hookSec:AddButton({ Title = "Send test message", Callback = function() S.hookTest = true end })
 
     ------------------------------------------------------------------
     -- 23. Stats tab
@@ -1951,15 +2345,13 @@ local function CreateMagicLootHub()
     local perfSec = Tabs.Misc:AddSection("Performance")
 
     perfSec:AddToggle("PerfMode", {
-        Title       = "Improve performance",
-        Description = "Lowest quality, no shadows/particles/trails, flat water",
-        Default     = false,
+        Title   = "Improve performance",
+        Default = false,
     }):OnChanged(function(v) S.perfWanted = v end)
 
     perfSec:AddButton({
-        Title       = "Clear debris & temp folders",
-        Description = "One-off sweep of accumulated effect junk",
-        Callback    = function()
+        Title    = "Clear debris & temp folders",
+        Callback = function()
             local n = 0
             for _, name in ipairs({ "Debris", N_TEMP, "Sound3D" }) do
                 local f = Workspace:FindFirstChild(name)
@@ -1975,27 +2367,12 @@ local function CreateMagicLootHub()
         end,
     })
 
-    local paceSec = Tabs.Misc:AddSection("Request budget")
-
-    paceSec:AddParagraph({
-        Title   = "Why this exists",
-        Content = "ToolSystem.RequestRateLimit drops anything past 20 requests per\n"
-               .. "second per message name, and the server also flags 10+ distinct\n"
-               .. "message names inside 5 seconds. 18 leaves headroom for the\n"
-               .. "game's own traffic. Raising it does not make anything faster -\n"
-               .. "it just gets requests thrown away.",
-    })
-
-    numberBox(paceSec, "ReqPerSec", "Max requests/sec per message", "Server hard limit is 20",
-        "reqPerSec")
-
     local infoSec    = Tabs.Misc:AddSection("Server")
     local serverInfo = infoSec:AddParagraph({ Title = "Info", Content = "reading..." })
 
     infoSec:AddButton({
-        Title       = "Unload hub",
-        Description = "Stops every loop and destroys the UI",
-        Callback    = function()
+        Title    = "Unload hub",
+        Callback = function()
             if _G.__MagicLootHub then
                 task.spawn(function() _G.__MagicLootHub:Unload() end)
             end
@@ -2024,7 +2401,8 @@ local function CreateMagicLootHub()
             wallet[#wallet + 1] = ("%s: %s")
                 :format(label("itemdataConf", id, "Item " .. id), short(bag(id)))
         end
-        wallet[#wallet + 1] = ("Temp bag pending: %d / %d"):format(limitBagUsed(), bag(5))
+        wallet[#wallet + 1] = ("Temp bag pending: %d / %d")
+            :format(limitBagUsed(), tempCap())
         walletPara:SetDesc(table.concat(wallet, "\n"))
 
         sessionPara:SetDesc(table.concat({
@@ -2057,8 +2435,8 @@ local function CreateMagicLootHub()
             ("Rotation: %d -> %d"):format(
                 math.clamp(math.floor(num(S.stageStart, 1)), 1, MAX_STAGE), stageCeiling()),
             ("Now: %s"):format(S.farmPhase),
-            ("Measured damage: %s/s   give up over %ds"):format(
-                short(S.dps), math.floor(num(S.maxClearSecs, 60))),
+            ("Measured damage: %s/s   walk away over %ds"):format(
+                short(math.max(S.dps, attr(1) * 2)), math.floor(num(S.etaLimit, 35))),
             ("DungeonAggroStage %d   InDungeonChallenge %d   SafeArea %d"):format(
                 flag("DungeonAggroStage"), flag("InDungeonChallenge"), flag("InStageSafeArea")),
             ("HP %d%%   CareerMaxStage %d"):format(
@@ -2066,9 +2444,33 @@ local function CreateMagicLootHub()
         }, "\n"))
 
         sellInfo:SetDesc(table.concat({
-            ("Pending in temp bag: %d"):format(limitBagUsed()),
+            ("Pending in temp bag: %d / %d"):format(limitBagUsed(), tempCap()),
+            ("Learned cap: %s"):format(capFull > 0
+                and ("%d (server refused past it)"):format(capFull)
+                or ("%d (still growing)"):format(math.max(tempHint(), capKnown))),
             ("Sold this session: %s"):format(comma(S.sold)),
             ("Flushes: %d"):format(S.flushes),
+        }, "\n"))
+
+        local ocOn = {}
+        for _, p in ipairs({
+            { "farm", S.ocFarm }, { "collect", S.ocCollect }, { "sell", S.ocSell },
+            { "train", S.ocTrain }, { "wand", S.ocWand }, { "rebirth", S.ocRebirth },
+        }) do
+            if p[2] then ocOn[#ocOn + 1] = p[1] end
+        end
+        oneInfo:SetDesc(table.concat({
+            ("OneClick: %s"):format(S.oneClick and "RUNNING" or "off"),
+            ("Doing: %s"):format(#ocOn > 0 and table.concat(ocOn, ", ") or "nothing selected"),
+            ("Now: %s"):format(S.oneClick and S.farmPhase or "-"),
+            ("Gold: %s   sold %s   rebirths %d"):format(
+                short(bag(1)), comma(S.sold), S.rebirths),
+        }, "\n"))
+
+        hookInfo:SetDesc(table.concat({
+            ("URL: %s"):format(S.hookUrl ~= "" and "set" or "not set - nothing is sent"),
+            ("Lines sent: %d   queued: %d"):format(S.hookSent, #hookQueue),
+            ("Last error: %s"):format(S.hookFail ~= "" and S.hookFail or "none"),
         }, "\n"))
 
         trainInfo:SetDesc(table.concat({
@@ -2084,7 +2486,7 @@ local function CreateMagicLootHub()
         serverInfo:SetDesc(table.concat({
             ("Players: %d"):format(#Players:GetPlayers()),
             ("Event: %s"):format(label("eventConf", flag("curEventId"), "none")),
-            ("Hub: v3"),
+            ("Hub: v4"),
         }, "\n"))
     end
 
@@ -2100,7 +2502,8 @@ local function CreateMagicLootHub()
         end)
     end
 
-    -- Rate comes from a number box, so re-read it on every iteration.
+    -- Every rate is a constant now, but the helper stays: it re-reads S so a
+    -- config load or an API poke takes effect on the next iteration.
     local function paced(rateKey, fn)
         task.spawn(function()
             while S.running and not Fluent.Unloaded do
@@ -2168,6 +2571,43 @@ local function CreateMagicLootHub()
         if S.perfWanted ~= S.perfApplied then applyPerformance(S.perfWanted) end
     end)
 
+    -- OneClick owns the feature switches while it is on, so ticking a sub-toggle
+    -- takes effect inside half a second.  It keeps applying for one tick after
+    -- being switched off - that is what turns everything back off - and then
+    -- stands aside so the individual tabs work on their own again.
+    local ocWas = false
+    every(0.4, function()
+        if S.oneClick or ocWas then oneClickApply() end
+        ocWas = S.oneClick
+    end)
+
+    -- Webhook: one POST every 3s at most, batched, so a wave of 11 drops is one
+    -- message instead of eleven.  Runs on its own thread; a hung request cannot
+    -- stall the farm.
+    every(1.0, function()
+        if S.hookTest then
+            S.hookTest = false
+            if S.hookUrl == "" then
+                S.hookFail = "no URL set"
+            else
+                local ok, why = httpPost(S.hookUrl, {
+                    username = "Magic Loot Hub",
+                    content  = (":white_check_mark: Magic Loot hub v4 connected."
+                        .. "\nLevel %d, %s gold, notifying from %s upward.")
+                        :format(bag(4), comma(bag(1)),
+                                rarityName(math.floor(num(S.hookRarity, 6)))),
+                })
+                S.hookFail = ok and "" or why
+                Fluent:Notify({
+                    Title    = "Webhook",
+                    Content  = ok and "Test message sent." or ("Failed: " .. tostring(why)),
+                    Duration = 5,
+                })
+            end
+        end
+        hookFlush()
+    end)
+
     ------------------------------------------------------------------
     -- 27. Config persistence
     ------------------------------------------------------------------
@@ -2182,8 +2622,8 @@ local function CreateMagicLootHub()
 
     Window:SelectTab(1)
     Fluent:Notify({
-        Title    = "Magic Loot hub v3",
-        Content  = "Everything starts off. Left Ctrl minimises.",
+        Title    = "Magic Loot hub v4",
+        Content  = "Flip OneClick and leave it. Left Ctrl minimises.",
         Duration = 6,
     })
     pcall(function() SaveManager:LoadAutoloadConfig() end)
@@ -2202,9 +2642,16 @@ local function CreateMagicLootHub()
         StagePlayable = stagePlayable, DiscoverStages = discoverStages,
         AwaitStage = awaitStage, EndRun = endRun, RunStage = runStage,
         HighestPlayable = highestPlayable,
+        OpenRunTo = openRunTo, ReturnToLobby = returnToLobby, DoorStand = doorStand,
+        Teleport = teleport, HoverStop = hoverStop, Flag = flag, LobbyStand = lobbyStand,
+        ClearFrontier = clearFrontier,
         -- bag
         PickupPass = pickupPass, SellableRows = sellableRows, Sell = sellEverything,
         FlushTempBag = flushTempBag, LimitBagUsed = limitBagUsed, TempCap = tempCap,
+        TempHint = tempHint, BagFull = bagFull, SettleAfterTown = settleAfterTown,
+        -- one click + webhook
+        OneClickApply = oneClickApply, HookPush = hookPush, HookFlush = hookFlush,
+        HttpPost = httpPost, RarityName = rarityName,
         -- misc
         TrainTick = trainTick, BuyWand = buyWand, EquipWand = equipWand, WandTick = wandTick,
         RebirthOnce = rebirthOnce, RebirthStatus = rebirthStatus,
@@ -2213,6 +2660,7 @@ local function CreateMagicLootHub()
 
     function API:Unload()
         S.running = false
+        S.oneClick = false
         for _, k in ipairs({ "killAura", "autoFarm", "autoPickup", "autoSell",
                              "autoTrain", "autoBuyWand", "autoRebirth" }) do
             S[k] = false
