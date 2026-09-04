@@ -14,7 +14,7 @@ local Lighting = game:GetService("Lighting")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LP = Players.LocalPlayer
-local Lib = _G.SpeedUiLibrary or loadstring(game:HttpGet("https://raw.githubusercontent.com/MinhPhuc-Dev/TaoMakeHub/refs/heads/main/SpeedUi.lua"))(), "=SpeedUi")()
+local Lib = _G.SpeedUiLibrary or loadstring(game:HttpGet("https://raw.githubusercontent.com/MinhPhuc-Dev/TaoMakeHub/refs/heads/main/SpeedUi.lua"), "=SpeedUi")()
 _G.SpeedUiLibrary = Lib
 local Flow = require(ReplicatedStorage:WaitForChild("FlowClient"))
 
@@ -496,7 +496,7 @@ local LOOT_TYPES = {
     "Tool",
 }
 local GATE_Z = 83700
-local GATE_PAST = 80
+local GATE_PAST = -60
 local GATE_STOP = 120
 local GATE_LIFT = 5
 local GATE_POLL = 0.5
@@ -507,7 +507,7 @@ local STEP_WAIT = 0.05
 local STEP_LIFT = 4
 local RUN_MAX = 150
 local HOLD_WAIT = 0.06
-local HOLD_MAX = 420
+local HOLD_MAX = 210
 local ARM_MAX = 6
 local ARM_TRIES = 2
 local ARM_WAIT = 0.3
@@ -537,11 +537,11 @@ local SHOP = {
 }
 local FINISH = {
     past = 600,
-    back = 200,
-    step = 45,
-    wait = 0.25,
-    jog = 6,
-    max = 90,
+    back = 400,
+    step = 60,
+    wait = 1.6,
+    poll = 0.1,
+    max = 120,
 }
 
 local LootData
@@ -1423,7 +1423,6 @@ end
 local function holdAtGate(x, y, z)
     local t0 = tick()
     local tg = 0
-    local wasOpen = false
     local lastTime, lastStamp, trips = nil, tick(), 0
     while F.autoWin do
         if gameEnded() then return true end
@@ -1433,14 +1432,14 @@ local function holdAtGate(x, y, z)
             local g = gateInfo()
             if g then
                 x, y, z = g.x, g.y + GATE_LIFT, g.z + GATE_PAST
-                if g.open and not wasOpen then
-                    wasOpen = true
+                if g.open then
                     notify("Auto Win", "border open", 3)
+                    return true
                 end
                 if g.time ~= lastTime then
                     lastTime, lastStamp = g.time, tick()
                 end
-                if not g.open and tick() - lastStamp > ARM_IDLE and trips < ARM_MAX then
+                if tick() - lastStamp > ARM_IDLE and trips < ARM_MAX then
                     trips = trips + 1
                     notify("Auto Win", "starting the border countdown", 3)
                     pokeConsole(trips)
@@ -1461,21 +1460,26 @@ end
 local function finishRun(gz)
     local t0 = tick()
     local z = gz - FINISH.back
-    local flip = 1
     while F.autoWin do
         if gameEnded() then return true end
         if tick() - t0 > FINISH.max then return false, "no finish trigger" end
         if not (Root and Root.Parent) then return false, "character lost" end
         if Hum and Hum.SeatPart then pcall(function() Hum.Sit = false end) end
-        local x, y = Root.Position.X, Root.Position.Y
         local r = roadAt(z)
-        if r then x, y = r.x, r.y + STEP_LIFT end
-        Root.CFrame = CFrame.new(x + flip * FINISH.jog, y, z)
+        local x = r and r.x or Root.Position.X
+        local y = (r and r.y or Root.Position.Y) + STEP_LIFT
+        Root.CFrame = CFrame.new(x, y, z)
         Root.AssemblyLinearVelocity = Vector3.zero
         Root.AssemblyAngularVelocity = Vector3.zero
-        flip = -flip
-        if z < gz + FINISH.past then z = z + FINISH.step end
-        task.wait(FINISH.wait)
+        if Hum then pcall(function() Hum:MoveTo(Vector3.new(x, y, z + FINISH.step)) end) end
+        local rest = tick()
+        while tick() - rest < FINISH.wait do
+            if gameEnded() then return true end
+            if not F.autoWin then return false, "cancelled" end
+            task.wait(FINISH.poll)
+        end
+        z = z + FINISH.step
+        if z > gz + FINISH.past then z = gz - FINISH.back end
     end
     return gameEnded(), "cancelled"
 end
@@ -1489,18 +1493,21 @@ local function autoWinBody()
     if Hum and Hum.SeatPart then pcall(function() Hum.Sit = false end) end
     notify("Auto Win", "heading for the border", 4)
     local ok, err = runTo(GATE_Z)
-    local g = gateInfo()
-    if ok and not gameEnded() then
-        if g then
+    for _ = 1, 2 do
+        if gameEnded() or not F.autoWin or not ok then break end
+        local g = gateInfo()
+        if not g then
+            ok, err = false, "border not found"
+            break
+        end
+        if not g.open then
             notify("Auto Win", g.time ~= "" and ("border opens in " .. g.time) or "waiting at the border", 5)
             ok, err = holdAtGate(g.x, g.y + GATE_LIFT, g.z + GATE_PAST)
-        else
-            ok, err = false, "border not found"
         end
-    end
-    if F.autoWin and not gameEnded() then
+        if gameEnded() or not F.autoWin or not ok then break end
         notify("Auto Win", "crossing into Mexico", 4)
-        ok, err = finishRun((g and g.z) or GATE_Z)
+        ok, err = finishRun((gateInfo() or g).z)
+        if ok then break end
     end
     if gameWon() then
         notify("Auto Win", "escaped", 8)
