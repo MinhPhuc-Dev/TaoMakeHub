@@ -14,7 +14,7 @@ local Lighting = game:GetService("Lighting")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LP = Players.LocalPlayer
-local Lib = _G.SpeedUiLibrary or loadstring(readfile("UJ/SpeedUi.lua"), "=SpeedUi")()
+local Lib = _G.SpeedUiLibrary or loadstring(readfile("https://raw.githubusercontent.com/MinhPhuc-Dev/TaoMakeHub/refs/heads/main/SpeedUi.lua"), "=SpeedUi")()
 _G.SpeedUiLibrary = Lib
 local Flow = require(ReplicatedStorage:WaitForChild("FlowClient"))
 
